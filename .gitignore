@@ -1,0 +1,42 @@
+# Databases
+*.db
+*.sqlite
+*.sqbpro
+
+# Logs
+*.log
+logs/
+
+# PDFs
+*.pdf
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE
+.idea/
+
+# Copies and backups
+*Copy*
+*copy*
+*backup*
+*old*
+*Copy (*
+
+# Data folders
+data/
+
+# Config files with sensitive data
+email_config.json
+*password*
+*secret*
+*credentials*
+
+# Large XML files (we'll add back specific ones if needed)
+*_response.xml
+
+# Batch files (optional)
+*.bat
