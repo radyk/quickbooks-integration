@@ -18,6 +18,8 @@ import argparse
 from pathlib import Path
 from datetime import datetime, date, timedelta
 import sqlite3
+import signal
+import platform
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -110,6 +112,12 @@ class QuickBooksSyncManager:
         self.next_sync_time = None
         self.countdown_seconds = 0
 
+        # Process tracking improvements
+        self.sync_start_time = None
+        self.sync_timeout = 3600  # 1 hour default timeout
+        self.last_output_time = None
+        self.output_stall_timeout = 300  # 5 minutes without output = stalled
+
         # Find main.py script
         self.main_script = self.find_main_script()
 
@@ -123,6 +131,9 @@ class QuickBooksSyncManager:
 
         # Start output monitoring
         self.monitor_output()
+
+        # Start process health monitoring
+        self.check_process_health()
 
         # Auto-start timer if requested
         if self.auto_start_minutes:
@@ -142,6 +153,313 @@ class QuickBooksSyncManager:
         x = (self.root.winfo_screenwidth() // 2) - (width // 2)
         y = (self.root.winfo_screenheight() // 2) - (height // 2)
         self.root.geometry(f'{width}x{height}+{x}+{y}')
+
+    def check_process_health(self):
+        """Periodically check if sync process is healthy"""
+        if self.sync_process:
+            poll_result = self.sync_process.poll()
+
+            if poll_result is None:
+                # Process is still running
+                if self.sync_start_time:
+                    elapsed = time.time() - self.sync_start_time
+
+                    # Check for timeout
+                    if elapsed > self.sync_timeout:
+                        self.log_output(f"\n!!! SYNC TIMEOUT: Process running for {elapsed / 60:.1f} minutes !!!")
+                        self.force_stop_sync()
+
+                    # Check for output stall
+                    elif self.last_output_time:
+                        output_elapsed = time.time() - self.last_output_time
+                        if output_elapsed > self.output_stall_timeout:
+                            self.log_output(f"\n!!! SYNC STALLED: No output for {output_elapsed / 60:.1f} minutes !!!")
+                            self.force_stop_sync()
+            else:
+                # Process terminated
+                if poll_result != 0:
+                    self.log_output(f"\n=== SYNC PROCESS TERMINATED WITH ERROR CODE: {poll_result} ===")
+                self.sync_process = None
+                self.sync_start_time = None
+                self.last_output_time = None
+
+        # Schedule next health check
+        self.root.after(5000, self.check_process_health)  # Check every 5 seconds
+
+    def is_sync_running(self):
+        """Check if sync is actually running (not just stalled)"""
+        if not self.sync_process:
+            return False
+
+        # Check if process is alive
+        poll_result = self.sync_process.poll()
+        if poll_result is not None:
+            # Process has terminated
+            self.sync_process = None
+            self.sync_start_time = None
+            self.last_output_time = None
+            return False
+
+        # Check for timeout
+        if self.sync_start_time:
+            elapsed = time.time() - self.sync_start_time
+            if elapsed > self.sync_timeout:
+                self.log_output(f"\nSync process appears stalled (running for {elapsed / 60:.1f} minutes)")
+                return False
+
+        return True
+
+    def kill_orphaned_processes(self):
+        """Kill any orphaned Python processes running main.py"""
+        self.log_output("\nChecking for orphaned sync processes...")
+        killed_count = 0
+
+        try:
+            if sys.platform == 'win32':
+                # Windows: Use WMI to find and kill processes
+                import subprocess
+
+                # Get current process ID to avoid killing ourselves
+                current_pid = os.getpid()
+
+                # Find Python processes with main.py in command line
+                cmd = 'wmic process where "name=\'python.exe\'" get ProcessId,CommandLine /FORMAT:CSV'
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+                if result.returncode == 0:
+                    lines = result.stdout.strip().split('\n')
+                    for line in lines:
+                        if 'main.py' in line and 'sync_manager.py' not in line:
+                            # Extract PID from the line
+                            parts = line.split(',')
+                            if len(parts) >= 3:
+                                try:
+                                    pid = int(parts[-1])
+                                    if pid != current_pid:
+                                        self.log_output(f"Killing orphaned process PID: {pid}")
+                                        subprocess.call(['taskkill', '/F', '/PID', str(pid)])
+                                        killed_count += 1
+                                except (ValueError, subprocess.CalledProcessError):
+                                    continue
+
+                # Alternative method using PowerShell
+                if killed_count == 0:
+                    ps_cmd = 'Get-Process python | Where-Object {$_.CommandLine -like "*main.py*"} | Stop-Process -Force'
+                    subprocess.run(['powershell', '-Command', ps_cmd], capture_output=True)
+
+            else:
+                # Unix/Linux: Use ps and grep
+                result = subprocess.run(['ps', 'aux'], capture_output=True, text=True)
+                for line in result.stdout.split('\n'):
+                    if 'python' in line and 'main.py' in line and 'sync_manager.py' not in line:
+                        parts = line.split()
+                        if len(parts) > 1:
+                            try:
+                                pid = int(parts[1])
+                                os.kill(pid, signal.SIGTERM)
+                                killed_count += 1
+                                self.log_output(f"Killed orphaned process PID: {pid}")
+                            except (ValueError, ProcessLookupError):
+                                continue
+
+        except Exception as e:
+            self.log_output(f"Error checking for orphaned processes: {e}")
+
+        if killed_count > 0:
+            self.log_output(f"Cleaned up {killed_count} orphaned processes")
+        else:
+            self.log_output("No orphaned processes found")
+
+    def run_command(self, cmd, message):
+        """Run a command and capture output - IMPROVED VERSION"""
+        # Clean up any dead process reference
+        if self.sync_process and self.sync_process.poll() is not None:
+            self.sync_process = None
+            self.sync_start_time = None
+            self.last_output_time = None
+
+        # Check if already running
+        if self.is_sync_running():
+            messagebox.showwarning("Sync Running", "A sync is already in progress!")
+            return
+
+        # Kill any orphaned processes before starting
+        self.kill_orphaned_processes()
+
+        self.log_output(f"\n{message}")
+        self.log_output(f"Command: {' '.join(cmd)}")
+        self.log_output("-" * 80)
+
+        # Record start time
+        self.sync_start_time = time.time()
+        self.last_output_time = time.time()
+
+        try:
+            # Platform-specific process creation
+            if sys.platform == 'win32':
+                # Windows: use CREATE_NEW_PROCESS_GROUP for better control
+                self.sync_process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    universal_newlines=True,
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                    env={**os.environ, 'PYTHONUNBUFFERED': '1'}
+                )
+            else:
+                # Unix/Linux: use process group
+                self.sync_process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    universal_newlines=True,
+                    preexec_fn=os.setsid,
+                    env={**os.environ, 'PYTHONUNBUFFERED': '1'}
+                )
+
+            self.log_output(f"Started process with PID: {self.sync_process.pid}")
+
+            # Start thread to read output
+            thread = threading.Thread(target=self.read_process_output, daemon=True)
+            thread.start()
+
+        except Exception as e:
+            self.log_output(f"Error starting process: {e}")
+            self.sync_process = None
+            self.sync_start_time = None
+            self.last_output_time = None
+
+    def read_process_output(self):
+        """Read process output in a thread"""
+        try:
+            for line in iter(self.sync_process.stdout.readline, ''):
+                if line:
+                    # Update last output time
+                    self.last_output_time = time.time()
+
+                    line = line.rstrip()
+
+                    # Handle progress lines differently (they use \r)
+                    if "Processing records" in line or "Processed" in line:
+                        # Progress update - update the last line instead of adding new
+                        self.output_queue.put(('progress', line))
+                    else:
+                        # Regular output
+                        self.output_queue.put(('normal', line))
+
+            self.sync_process.wait()
+
+            # Process finished
+            if self.sync_process.returncode == 0:
+                self.output_queue.put(('normal', "\n=== PROCESS COMPLETED SUCCESSFULLY ==="))
+            else:
+                self.output_queue.put(
+                    ('normal', f"\n=== PROCESS FAILED (Exit code: {self.sync_process.returncode}) ==="))
+
+            # Clear process references
+            self.sync_process = None
+            self.sync_start_time = None
+            self.last_output_time = None
+
+            # Refresh status after sync
+            self.root.after(1000, self.load_sync_status)
+
+            # Check if Goal Tracker should run after successful sync
+            if self.sync_process and self.sync_process.returncode == 0:
+                self.root.after(2000, self.check_goal_tracker_schedule)
+
+        except Exception as e:
+            self.output_queue.put(('normal', f"Error reading output: {e}"))
+            self.sync_process = None
+            self.sync_start_time = None
+            self.last_output_time = None
+
+    def stop_sync(self):
+        """Stop running sync process - IMPROVED VERSION"""
+        if self.sync_process:
+            pid = self.sync_process.pid
+            poll_result = self.sync_process.poll()
+
+            if poll_result is None:
+                # Process is still running
+                self.log_output(f"\n=== STOPPING SYNC PROCESS (PID: {pid}) ===")
+
+                try:
+                    if sys.platform == 'win32':
+                        # Windows: Try graceful shutdown first
+                        try:
+                            self.sync_process.terminate()
+                            # Give it 5 seconds to terminate
+                            self.sync_process.wait(timeout=5)
+                            self.log_output("Process terminated gracefully")
+                        except subprocess.TimeoutExpired:
+                            # Force kill using taskkill
+                            subprocess.call(['taskkill', '/F', '/T', '/PID', str(pid)])
+                            self.log_output("Process force killed")
+                    else:
+                        # Unix/Linux: Kill process group
+                        try:
+                            os.killpg(os.getpgid(pid), signal.SIGTERM)
+                            self.sync_process.wait(timeout=5)
+                            self.log_output("Process terminated gracefully")
+                        except subprocess.TimeoutExpired:
+                            os.killpg(os.getpgid(pid), signal.SIGKILL)
+                            self.log_output("Process force killed")
+
+                except Exception as e:
+                    self.log_output(f"Error stopping process: {e}")
+                    self.force_stop_sync()
+            else:
+                self.log_output("Process was already terminated")
+
+            # Clean up
+            self.sync_process = None
+            self.sync_start_time = None
+            self.last_output_time = None
+
+        else:
+            # No process reference, check for orphans
+            self.kill_orphaned_processes()
+            messagebox.showinfo("No Process", "No sync process is currently running.")
+
+    def force_stop_sync(self):
+        """Force kill the sync process and any children"""
+        if self.sync_process:
+            try:
+                pid = self.sync_process.pid
+                self.log_output(f"Force killing sync process {pid}...")
+
+                if sys.platform == 'win32':
+                    # Windows: Kill process tree
+                    subprocess.call(['taskkill', '/F', '/T', '/PID', str(pid)])
+                    # Also try WMI method
+                    subprocess.run(
+                        f'wmic process where "ParentProcessId={pid}" delete',
+                        shell=True, capture_output=True
+                    )
+                else:
+                    # Unix: Kill process group
+                    try:
+                        os.killpg(os.getpgid(pid), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+                self.log_output("Process force killed")
+
+            except Exception as e:
+                self.log_output(f"Error force killing process: {e}")
+
+            finally:
+                self.sync_process = None
+                self.sync_start_time = None
+                self.last_output_time = None
+
+        # Always check for orphans
+        self.kill_orphaned_processes()
 
     def auto_start_timer(self):
         """Auto-start the timer with command-line specified interval"""
@@ -799,7 +1117,7 @@ class QuickBooksSyncManager:
 
     def sync_all_tables(self):
         """Sync all tables"""
-        if self.sync_process and self.sync_process.poll() is None:
+        if self.is_sync_running():
             messagebox.showwarning("Sync Running", "A sync is already in progress!")
             return
 
@@ -815,7 +1133,7 @@ class QuickBooksSyncManager:
 
     def sync_selected_tables(self):
         """Sync selected tables"""
-        if self.sync_process and self.sync_process.poll() is None:
+        if self.is_sync_running():
             messagebox.showwarning("Sync Running", "A sync is already in progress!")
             return
 
@@ -1157,68 +1475,13 @@ class QuickBooksSyncManager:
         self.last_sync_label.config(text=f"Last sync: {self.last_sync_time.strftime('%H:%M:%S')}")
 
         # Check if sync already running
-        if self.sync_process and self.sync_process.poll() is None:
+        if self.is_sync_running():
             self.log_output("Sync already in progress, skipping auto-sync")
             return
 
         # Run incremental sync of all tables (skip auto-analysis for timer syncs)
         cmd = [sys.executable, self.main_script, "--skip-auto-analysis"]
         self.run_command(cmd, "Running scheduled incremental sync...")
-
-    def run_command(self, cmd, message):
-        """Run a command and capture output"""
-        self.log_output(f"\n{message}")
-        self.log_output(f"Command: {' '.join(cmd)}")
-        self.log_output("-" * 80)
-
-        # Start process with unbuffered output for real-time progress
-        self.sync_process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            universal_newlines=True,
-            env={**os.environ, 'PYTHONUNBUFFERED': '1'}  # Force unbuffered output
-        )
-
-        # Start thread to read output
-        thread = threading.Thread(target=self.read_process_output, daemon=True)
-        thread.start()
-
-    def read_process_output(self):
-        """Read process output in a thread"""
-        try:
-            for line in iter(self.sync_process.stdout.readline, ''):
-                if line:
-                    line = line.rstrip()
-
-                    # Handle progress lines differently (they use \r)
-                    if "Processing records" in line or "Processed" in line:
-                        # Progress update - update the last line instead of adding new
-                        self.output_queue.put(('progress', line))
-                    else:
-                        # Regular output
-                        self.output_queue.put(('normal', line))
-
-            self.sync_process.wait()
-
-            # Process finished
-            if self.sync_process.returncode == 0:
-                self.output_queue.put(('normal', "\n=== PROCESS COMPLETED SUCCESSFULLY ==="))
-            else:
-                self.output_queue.put(
-                    ('normal', f"\n=== PROCESS FAILED (Exit code: {self.sync_process.returncode}) ==="))
-
-            # Refresh status after sync
-            self.root.after(1000, self.load_sync_status)
-
-            # Check if Goal Tracker should run after successful sync
-            if self.sync_process.returncode == 0:
-                self.root.after(2000, self.check_goal_tracker_schedule)
-
-        except Exception as e:
-            self.output_queue.put(('normal', f"Error reading output: {e}"))
 
     def monitor_output(self):
         """Monitor output queue and update console"""
@@ -1264,6 +1527,10 @@ class QuickBooksSyncManager:
 
     def log_output(self, text):
         """Log text to console"""
+        # Update last output time for stall detection
+        if hasattr(self, 'sync_process') and self.sync_process:
+            self.last_output_time = time.time()
+
         self.console_text.insert('end', text + '\n')
 
         if self.autoscroll_var.get():
@@ -1286,14 +1553,6 @@ class QuickBooksSyncManager:
                 f.write(self.console_text.get(1.0, 'end'))
 
             messagebox.showinfo("Save Complete", f"Console output saved to:\n{filename}")
-
-    def stop_sync(self):
-        """Stop running sync process"""
-        if self.sync_process and self.sync_process.poll() is None:
-            self.sync_process.terminate()
-            self.log_output("\n=== SYNC PROCESS TERMINATED BY USER ===")
-        else:
-            messagebox.showinfo("No Process", "No sync process is currently running.")
 
     # Goal Tracker Methods
     def save_goal_tracker_config(self):

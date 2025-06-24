@@ -9,7 +9,7 @@ from typing import List, Dict, Any, Optional, Set, Tuple
 import datetime
 from contextlib import contextmanager
 
-from .base import DatabaseInterface, SyncStatus, FieldTypes
+from .base import DatabaseInterface, SyncStatus, FieldTypes, MetadataBugStatus
 
 
 class SQLiteDatabase(DatabaseInterface):
@@ -63,8 +63,6 @@ class SQLiteDatabase(DatabaseInterface):
             yield cursor
         finally:
             cursor.close()
-
-    # In sqlite_db.py, update the create_table method around line 64:
 
     def create_table(self, table_name: str, fields_dict: Dict[str, str], primary_key: str) -> None:
         """Create table with specified schema"""
@@ -131,7 +129,6 @@ class SQLiteDatabase(DatabaseInterface):
 
                 self.connection.commit()
                 logging.info(f"Table '{table_name}' created successfully")
-
 
     def table_exists(self, table_name: str) -> bool:
         """Check if table exists"""
@@ -763,3 +760,216 @@ class SQLiteDatabase(DatabaseInterface):
                 stats['custom_fields_count'] = self.get_record_count('custom_fields_registry')
 
         return stats
+
+    # Metadata bug tracking methods
+    def initialize_metadata_bug_tracker(self) -> None:
+        """Initialize the metadata bug tracking table"""
+        with self._get_cursor() as cursor:
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS qb_metadata_bug_tracker (
+                TxnID TEXT NOT NULL,
+                TableName TEXT NOT NULL,
+                RefNumber TEXT,
+                EditSequence TEXT,
+                FirstAttemptDate TEXT,
+                LastAttemptDate TEXT,
+                AttemptCount INTEGER DEFAULT 0,
+                Status TEXT DEFAULT 'PENDING',
+                LastError TEXT,
+                PRIMARY KEY (TxnID, TableName)
+            )
+            ''')
+
+            # Create index for status queries
+            cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_metadata_bug_status 
+            ON qb_metadata_bug_tracker (Status, AttemptCount)
+            ''')
+
+            self.connection.commit()
+            logging.debug("Initialized qb_metadata_bug_tracker table")
+
+    def detect_orphaned_records(self, table_name: str) -> List[Dict[str, Any]]:
+        """
+        Detect header records that have no line items (QuickBooks metadata bug)
+
+        Args:
+            table_name: Name of the table to check (must have line items)
+
+        Returns:
+            List of orphaned records with their details
+        """
+        # Only applies to tables with line items
+        if table_name not in ['invoices', 'sales_orders', 'purchase_orders',
+                              'estimates', 'credit_memos']:
+            return []
+
+        with self._get_cursor() as cursor:
+            # First, check what columns exist in this table
+            cursor.execute(f"PRAGMA table_info('{table_name}')")
+            columns = {row[1] for row in cursor.fetchall()}
+
+            # Build SELECT clause based on available columns
+            select_fields = ['h.TxnID', 'h.RefNumber']
+
+            # Add EditSequence if it exists
+            if 'EditSequence' in columns:
+                select_fields.append('h.EditSequence')
+            else:
+                select_fields.append('NULL as EditSequence')
+
+            # Add Amount if it exists (different tables might use different amount fields)
+            amount_field = None
+            if 'Amount' in columns:
+                amount_field = 'Amount'
+            elif 'Subtotal' in columns:
+                amount_field = 'Subtotal'
+            elif 'TotalAmount' in columns:
+                amount_field = 'TotalAmount'
+
+            if amount_field:
+                select_fields.append(f'h.{amount_field} as Amount')
+            else:
+                select_fields.append('NULL as Amount')
+
+            # Add TxnDate if it exists
+            if 'TxnDate' in columns:
+                select_fields.append('h.TxnDate')
+            else:
+                select_fields.append('NULL as TxnDate')
+
+            # Add customer/vendor fields
+            if 'CustomerRef_FullName' in columns:
+                select_fields.append('h.CustomerRef_FullName')
+            else:
+                select_fields.append('NULL as CustomerRef_FullName')
+
+            if 'VendorRef_FullName' in columns:
+                select_fields.append('h.VendorRef_FullName')
+            else:
+                select_fields.append('NULL as VendorRef_FullName')
+
+            # Build the query
+            query = f"""
+            SELECT 
+                {', '.join(select_fields)}
+            FROM {table_name} h
+            LEFT JOIN {table_name}_line_items l ON h.TxnID = l.TxnID
+            WHERE l.TxnID IS NULL
+            ORDER BY h.TxnDate DESC
+            """
+
+            cursor.execute(query)
+            results = cursor.fetchall()
+
+            orphaned_records = []
+            for row in results:
+                record = {
+                    'TxnID': row[0],
+                    'RefNumber': row[1],
+                    'EditSequence': row[2],
+                    'Amount': row[3] or 0.0,  # Handle NULL amounts as 0
+                    'TxnDate': row[4],
+                    'CustomerRef_FullName': row[5],
+                    'VendorRef_FullName': row[6]
+                }
+                orphaned_records.append(record)
+
+            return orphaned_records
+
+    def get_fix_attempt_status(self, txn_id: str, table_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Get the fix attempt status for a specific record
+        Returns dict with: AttemptCount, Status, LastAttemptDate, etc.
+        """
+        with self._get_cursor() as cursor:
+            cursor.execute("""
+                SELECT AttemptCount, Status, LastAttemptDate, LastError
+                FROM qb_metadata_bug_tracker
+                WHERE TxnID = ? AND TableName = ?
+            """, (txn_id, table_name))
+
+            row = cursor.fetchone()
+            if row:
+                return {
+                    'AttemptCount': row[0],
+                    'Status': row[1],
+                    'LastAttemptDate': row[2],
+                    'LastError': row[3]
+                }
+        return None
+
+    def record_fix_attempt(self, txn_id: str, table_name: str,
+                          success: bool, error_message: Optional[str] = None,
+                          ref_number: Optional[str] = None,
+                          edit_sequence: Optional[str] = None) -> None:
+        """Record a fix attempt for a specific transaction"""
+        current_time = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
+
+        with self._get_cursor() as cursor:
+            # Check if record exists
+            cursor.execute("""
+                SELECT AttemptCount FROM qb_metadata_bug_tracker
+                WHERE TxnID = ? AND TableName = ?
+            """, (txn_id, table_name))
+
+            existing = cursor.fetchone()
+
+            if existing:
+                # Update existing record
+                new_count = existing[0] + 1
+                new_status = MetadataBugStatus.FIXED if success else (
+                    MetadataBugStatus.FAILED if new_count >= 3 else MetadataBugStatus.PENDING
+                )
+
+                cursor.execute("""
+                    UPDATE qb_metadata_bug_tracker
+                    SET LastAttemptDate = ?,
+                        AttemptCount = ?,
+                        Status = ?,
+                        LastError = ?,
+                        EditSequence = COALESCE(?, EditSequence),
+                        RefNumber = COALESCE(?, RefNumber)
+                    WHERE TxnID = ? AND TableName = ?
+                """, (current_time, new_count, new_status, error_message,
+                      edit_sequence, ref_number, txn_id, table_name))
+            else:
+                # Insert new record
+                status = MetadataBugStatus.FIXED if success else MetadataBugStatus.PENDING
+
+                cursor.execute("""
+                    INSERT INTO qb_metadata_bug_tracker
+                    (TxnID, TableName, RefNumber, EditSequence, FirstAttemptDate, 
+                     LastAttemptDate, AttemptCount, Status, LastError)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (txn_id, table_name, ref_number, edit_sequence, current_time,
+                      current_time, 1, status, error_message))
+
+            self.connection.commit()
+
+    def get_failed_fix_attempts(self) -> List[Dict[str, Any]]:
+        """Get all records that failed after 3 attempts"""
+        failed_records = []
+
+        with self._get_cursor() as cursor:
+            cursor.execute("""
+                SELECT TxnID, TableName, RefNumber, EditSequence, 
+                       FirstAttemptDate, LastAttemptDate, AttemptCount, LastError
+                FROM qb_metadata_bug_tracker
+                WHERE Status = ? AND AttemptCount >= 3
+                ORDER BY TableName, RefNumber
+            """, (MetadataBugStatus.FAILED,))
+
+            for row in cursor.fetchall():
+                failed_records.append({
+                    'TxnID': row[0],
+                    'TableName': row[1],
+                    'RefNumber': row[2],
+                    'EditSequence': row[3],
+                    'FirstAttemptDate': row[4],
+                    'LastAttemptDate': row[5],
+                    'AttemptCount': row[6],
+                    'LastError': row[7]
+                })
+
+        return failed_records

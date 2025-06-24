@@ -129,6 +129,39 @@ class DatabaseInterface(ABC):
         """Verify database integrity and return stats"""
         pass
 
+    # Metadata bug tracking methods
+    @abstractmethod
+    def initialize_metadata_bug_tracker(self) -> None:
+        """Initialize the metadata bug tracking table"""
+        pass
+
+    @abstractmethod
+    def detect_orphaned_records(self, table_name: str) -> List[Dict[str, Any]]:
+        """
+        Detect records with missing line items
+        Returns list of dicts with: TxnID, RefNumber, EditSequence, Amount
+        """
+        pass
+
+    @abstractmethod
+    def get_fix_attempt_status(self, txn_id: str, table_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Get the fix attempt status for a specific record
+        Returns dict with: AttemptCount, Status, LastAttemptDate, etc.
+        """
+        pass
+
+    @abstractmethod
+    def record_fix_attempt(self, txn_id: str, table_name: str,
+                          success: bool, error_message: Optional[str] = None) -> None:
+        """Record a fix attempt for a specific transaction"""
+        pass
+
+    @abstractmethod
+    def get_failed_fix_attempts(self) -> List[Dict[str, Any]]:
+        """Get all records that failed after 3 attempts"""
+        pass
+
 
 class SyncStatus:
     """Constants for sync status values"""
@@ -198,3 +231,10 @@ class FieldTypes:
             return '.' in s or 'e' in s.lower()
         except ValueError:
             return False
+
+
+class MetadataBugStatus:
+    """Constants for metadata bug fix status"""
+    PENDING = "PENDING"
+    FIXED = "FIXED"
+    FAILED = "FAILED"
